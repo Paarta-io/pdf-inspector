@@ -1291,6 +1291,20 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Caller-known figure regions (vector drawings the caller renders itself) that should get an
+    /// image placeholder in reading order like image XObjects do.
+    pub extra_image_regions: Vec<ImageRegion>,
+}
+
+/// A page region in the visible-page-box frame (points, lower-left origin, `y` = bottom edge).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRegion {
+    /// 1-indexed page.
+    pub page: u32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 impl Default for MarkdownOptions {
@@ -1320,6 +1334,7 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            extra_image_regions: Vec::new(),
         }
     }
 }

@@ -58,7 +58,7 @@ pub use extractor::{
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
+    to_markdown_from_items_with_rects_and_page_count, ImageRegion, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
@@ -523,7 +523,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
+    let ((mut all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -533,6 +533,29 @@ fn extract_pages_markdown_mem_impl(
         } else {
             extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
         };
+    // Caller-supplied figure regions become image items so they get reading-order placeholders.
+    for (i, region) in markdown_options.extra_image_regions.iter().enumerate() {
+        all_items.push(TextItem {
+            text: format!("[Image: region-{i}]"),
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+            rotation: 0.0,
+            advance_known: false,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size: 0.0,
+            page: region.page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Image,
+            mcid: None,
+            baseline_shift: 0.0,
+        });
+    }
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
