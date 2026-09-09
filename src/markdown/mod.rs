@@ -1389,6 +1389,25 @@ pub(crate) fn strip_repeated_header_footer_lines(
 }
 
 /// Convert positioned text items to markdown with structure detection
+/// Scheme of the placeholder target `include_images` emits: `pdfimg:<page>:<ordinal>:<x>:<y>:<w>:<h>`
+/// (1-indexed page, ordinal in content-stream order, bbox in PDF points with the page's lower-left origin).
+pub const IMAGE_PLACEHOLDER_SCHEME: &str = "pdfimg:";
+
+pub fn image_placeholder_target(page: u32, ordinal: u32, x: f32, y: f32, width: f32, height: f32) -> String {
+    format!("{IMAGE_PLACEHOLDER_SCHEME}{page}:{ordinal}:{x:.2}:{y:.2}:{width:.2}:{height:.2}")
+}
+
+/// `markdown` with the `include_images` placeholder lines removed, for quality checks that must
+/// judge text only (an image-only scan is still a scan).
+pub fn without_image_placeholders(markdown: &str) -> String {
+    let scheme = format!("]({IMAGE_PLACEHOLDER_SCHEME}");
+    markdown
+        .lines()
+        .filter(|line| !(line.starts_with("![") && line.contains(&scheme)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
     to_markdown_from_items_with_rects(items, options, &[])
 }
@@ -2141,13 +2160,22 @@ fn convert_items_with_rects_lines_and_table_output(
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
     let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    let mut page_image_ordinals: HashMap<u32, u32> = HashMap::new();
     for img in &images {
         let img_name = img
             .text
             .strip_prefix("[Image: ")
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
+        // Ordinal in content-stream order plus the bbox in the page frame, so a
+        // caller holding the decoded XObjects can pair each placeholder with its pixels.
+        let ordinal = page_image_ordinals.entry(img.page).or_insert(0);
+        let img_md = format!(
+            "![Image: {}]({})\n",
+            img_name,
+            image_placeholder_target(img.page, *ordinal, img.x, img.y, img.width, img.height)
+        );
+        *ordinal += 1;
         page_images
             .entry(img.page)
             .or_default()

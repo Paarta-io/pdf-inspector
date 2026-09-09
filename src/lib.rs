@@ -470,15 +470,19 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
-    extract_pages_markdown_mem_impl(
-        buffer,
-        pages,
-        None,
-        &MarkdownOptions::default(),
-        false,
-        false,
-    )
-    .map(|extraction| extraction.result)
+    extract_pages_markdown_mem_with_options(buffer, pages, &MarkdownOptions::default())
+}
+
+/// [`extract_pages_markdown_mem`] with caller-supplied markdown options; `include_images`
+/// emits `![Image: …](pdfimg:…)` placeholders in reading order (see
+/// [`markdown::image_placeholder_target`]) without affecting the OCR verdict.
+pub fn extract_pages_markdown_mem_with_options(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    markdown_options: &MarkdownOptions,
+) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(buffer, pages, None, markdown_options, false, false)
+        .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -672,8 +676,13 @@ fn extract_pages_markdown_mem_impl(
             )
         };
 
+        let md_text = if markdown_options.include_images {
+            markdown::without_image_placeholders(&md)
+        } else {
+            md.clone()
+        };
         let has_decoding_issue = has_text_quality_issue
-            || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+            || (!md_text.is_empty() && (is_cid_garbage(&md_text) || detect_encoding_issues(&md_text)));
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -690,9 +699,9 @@ fn extract_pages_markdown_mem_impl(
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
         let needs_ocr = ocr_reason.is_some()
-            || md.trim().is_empty()
+            || md_text.trim().is_empty()
             || has_gid
-            || is_garbage_text(&md)
+            || is_garbage_text(&md_text)
             || has_template_image
             || has_vector_text;
 
