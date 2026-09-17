@@ -558,6 +558,46 @@ fn is_running_furniture_table(
     total > 0 && (furniture as f32) >= (total as f32) * 0.8
 }
 
+/// A source-code listing printed on a background rectangle (web-to-PDF docs,
+/// IDE exports) clusters into columns at the token gaps and comes back as a
+/// table. Its rows are statements, not records: nearly every row reads as
+/// code once the cells are joined, and at least one row opens with a
+/// declaration keyword or closes a statement. A reference table whose cells
+/// merely contain signatures or symbols does neither.
+fn is_code_block_table(table: &crate::tables::Table) -> bool {
+    let rows: Vec<String> = table
+        .cells
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.trim())
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|row| !row.is_empty())
+        .collect();
+    if rows.len() < 2 {
+        return false;
+    }
+    let code_rows = rows.iter().filter(|row| is_code_like(row)).count();
+    let statement_rows = rows.iter().filter(|row| opens_or_closes_statement(row)).count();
+    code_rows * 5 >= rows.len() * 4 && statement_rows > 0
+}
+
+fn opens_or_closes_statement(row: &str) -> bool {
+    const OPENERS: [&str; 14] = [
+        "const ", "let ", "var ", "import ", "export ", "function ", "class ", "def ", "fn ",
+        "pub fn ", "return ", "if (", "for (", "while (",
+    ];
+    let trimmed = row.trim();
+    OPENERS.iter().any(|opener| trimmed.starts_with(opener))
+        || trimmed.ends_with(';')
+        || trimmed.ends_with('{')
+        || trimmed.ends_with("});")
+        || trimmed == "}"
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
@@ -875,6 +915,15 @@ impl TableDetectionOutput {
         table: &crate::tables::Table,
         chart_order: Option<ChartProseOrder>,
     ) {
+        if is_code_block_table(table) {
+            log::debug!(
+                "page {}: rejected {}x{} table hypothesis made of code lines",
+                page,
+                table.rows.len(),
+                table.columns.len()
+            );
+            return;
+        }
         self.pages_with_detected_tables.insert(page);
         match self.mode {
             TableOutputMode::Markdown => {
@@ -3544,3 +3593,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod code_block_table_tests {
+    use super::is_code_block_table;
+    use crate::tables::{Table, TableKind};
+
+    fn table(cells: Vec<Vec<&str>>) -> Table {
+        let cols = cells.iter().map(|r| r.len()).max().unwrap_or(0);
+        Table {
+            columns: (0..cols).map(|c| c as f32 * 100.0).collect(),
+            rows: (0..cells.len()).map(|r| 700.0 - r as f32 * 20.0).collect(),
+            cells: cells
+                .into_iter()
+                .map(|r| r.into_iter().map(String::from).collect())
+                .collect(),
+            item_indices: Vec::new(),
+            kind: TableKind::Data,
+        }
+    }
+
+    #[test]
+    fn a_code_listing_split_at_token_gaps_is_not_a_table() {
+        let listing = table(vec![
+            vec!["const {createHmac", "}", "= await", "import('node:crypto');"],
+            vec!["const secret", "= 'abcdefg';", "", ""],
+            vec!["const hash console.log(", "= createHmac('sha256',", "love", "secret) cupcakes')"],
+        ]);
+        assert!(is_code_block_table(&listing));
+    }
+
+    #[test]
+    fn an_api_reference_table_with_signatures_in_cells_stays_a_table() {
+        let reference = table(vec![
+            vec!["Key Type", "Description", "OID"],
+            vec!["'dh'", "Diffie-Hellman", "1.2.840.113549.1.3.1"],
+            vec!["'ec'", "Elliptic curve", "1.2.840.10045.2.1"],
+            vec!["cipher.update(data[, inputEncoding][, outputEncoding])", "Updates the cipher", ""],
+        ]);
+        assert!(!is_code_block_table(&reference));
+    }
+}
+
