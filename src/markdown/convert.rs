@@ -11,7 +11,9 @@ use super::analysis::{
     detect_header_level, font_size_rarity, has_dot_leaders, is_heading_fragment, is_toc_entry_line,
     is_toc_marker_heading,
 };
-use super::classify::{format_list_item, is_caption_line, is_list_item, starts_with_bullet_marker};
+use super::classify::{
+    format_list_item, is_callout_text, is_caption_line, is_list_item, starts_with_bullet_marker,
+};
 use super::heading::classify_heading_sequences;
 use super::postprocess::clean_markdown;
 use super::preprocess::{merge_drop_caps, merge_heading_lines};
@@ -771,9 +773,11 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
+    let lines = super::preprocess::split_display_runs(lines);
 
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
+    let page_right_edges = page_right_edges(&lines);
 
     // Merge consecutive heading lines at the same level (e.g., wrapped titles)
     let lines = merge_heading_lines(lines, base_size, &heading_tiers, struct_roles);
@@ -838,6 +842,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
     let mut prev_x = 0.0f32;
+    let mut prev_line_end = LineEnd::default();
+    let mut paragraph_reached_margin = false;
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
@@ -1005,7 +1011,16 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && !line_all_bold
             && y_gap > base_size * 1.2
             && y_gap <= para_threshold;
-        if (is_para_break || is_band_switch || is_bold_to_regular_break) && in_paragraph {
+        let page_right = page_right_edges.get(&line.page).copied();
+        let is_sentence_break = in_paragraph
+            && paragraph_reached_margin
+            && y_gap > 0.0
+            && y_gap <= para_threshold
+            && ends_short_of_the_margin(&prev_line_end, page_right)
+            && starts_a_sentence(&line.text());
+        if (is_para_break || is_band_switch || is_bold_to_regular_break || is_sentence_break)
+            && in_paragraph
+        {
             output.push_str("\n\n");
             in_paragraph = false;
             paragraph_in_wrapped_bold_run = false;
@@ -1014,6 +1029,13 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         // Let the continuation check below decide if we're still in a list
         prev_y = line.y;
         prev_x = line_x;
+        prev_line_end = line_end(line);
+        if !in_paragraph {
+            paragraph_reached_margin = false;
+        }
+        if page_right.is_some_and(|right| prev_line_end.right >= right * FULL_LINE_RATIO) {
+            paragraph_reached_margin = true;
+        }
 
         // Get text with optional bold/italic formatting
         let text = line.text_with_formatting(
@@ -1109,6 +1131,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             && !looks_like_list_continuation
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
+            && !is_display_callout(line, plain_trimmed, base_size)
             && !starts_with_bullet_marker(plain_trimmed)
             && !is_toc_entry_line(plain_trimmed)
             && !is_heading_fragment(plain_trimmed)
@@ -1197,6 +1220,18 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             continue;
         }
 
+        // A display-size callout ("18%") is emphasis, not structure: it goes
+        // out bold on its own line and never opens a heading.
+        if options.detect_headers && is_display_callout(line, plain_trimmed, base_size) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
+            }
+            output.push_str(&format!("**{}**\n\n", plain_trimmed));
+            in_list = false;
+            continue;
+        }
         // Structure-tree list item (LI only — LBody is a continuation, not a new item).
         // Some tagged PDFs use a "flat" style where every wrapped line in a list item
         // gets its own MCID tagged directly under LI. When we're already inside a list
@@ -1348,6 +1383,70 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     clean_markdown(output, &options)
 }
 
+/// Where the previous line stopped: its text and its right edge.
+#[derive(Default)]
+struct LineEnd {
+    text: String,
+    right: f32,
+}
+
+fn line_end(line: &TextLine) -> LineEnd {
+    LineEnd {
+        text: line.text().trim_end().to_string(),
+        right: line
+            .items
+            .iter()
+            .map(|item| item.x + item.width)
+            .fold(0.0, f32::max),
+    }
+}
+
+/// Right edge of the widest line on each page: the column's text margin.
+fn page_right_edges(lines: &[TextLine]) -> HashMap<u32, f32> {
+    let mut edges: HashMap<u32, f32> = HashMap::new();
+    for line in lines {
+        let right = line_end(line).right;
+        let entry = edges.entry(line.page).or_insert(right);
+        if right > *entry {
+            *entry = right;
+        }
+    }
+    edges
+}
+
+/// Brochure layouts set paragraphs flush without vertical space between
+/// them; the only trace of the break is a last line that ends a sentence and
+/// stops well short of the margin. Full-width sentence ends are ordinary
+/// wrapped text and do not qualify.
+const FULL_LINE_RATIO: f32 = 0.9;
+
+fn ends_short_of_the_margin(prev: &LineEnd, page_right: Option<f32>) -> bool {
+    const SHORT_LINE_RATIO: f32 = 0.85;
+    let Some(page_right) = page_right else {
+        return false;
+    };
+    let ends_sentence = prev.text.ends_with(['.', '!', '?']) || prev.text.ends_with(".\"");
+    ends_sentence && page_right > 0.0 && prev.right < page_right * SHORT_LINE_RATIO
+}
+
+/// A figure set in display type: "18%" at 60pt over 11pt body. Small-type
+/// figures ("(R-12)" on a title page) keep their normal heading treatment.
+fn is_display_callout(line: &TextLine, text: &str, base_size: f32) -> bool {
+    const DISPLAY_RATIO: f32 = 1.5;
+    is_callout_text(text)
+        && line
+            .items
+            .first()
+            .is_some_and(|item| item.font_size >= base_size * DISPLAY_RATIO)
+}
+
+fn starts_a_sentence(text: &str) -> bool {
+    text.trim_start()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_uppercase())
+}
+
 /// Convert text lines to markdown
 pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) -> String {
     if lines.is_empty() {
@@ -1363,9 +1462,11 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
     // Merge drop caps with following text
     let lines = merge_drop_caps(lines, base_size);
+    let lines = super::preprocess::split_display_runs(lines);
 
     // Discover heading tiers for this document
     let heading_tiers = compute_heading_tiers(&lines, base_size);
+    let page_right_edges = page_right_edges(&lines);
 
     // Merge consecutive heading lines at the same level (e.g., wrapped titles)
     let lines = merge_heading_lines(lines, base_size, &heading_tiers, None);
@@ -1387,6 +1488,8 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
     let mut output = String::new();
     let mut current_page = 0u32;
     let mut prev_y = f32::MAX;
+    let mut prev_line_end = LineEnd::default();
+    let mut paragraph_reached_margin = false;
     let mut in_list = false;
     let mut in_paragraph = false;
     let mut last_list_x: Option<f32> = None;
@@ -1428,7 +1531,14 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             && !line_all_bold
             && y_gap > base_size * 1.2
             && y_gap <= para_threshold;
-        if (is_para_break || is_bold_to_regular_break) && in_paragraph {
+        let page_right = page_right_edges.get(&line.page).copied();
+        let is_sentence_break = in_paragraph
+            && paragraph_reached_margin
+            && y_gap > 0.0
+            && y_gap <= para_threshold
+            && ends_short_of_the_margin(&prev_line_end, page_right)
+            && starts_a_sentence(&line.text());
+        if (is_para_break || is_bold_to_regular_break || is_sentence_break) && in_paragraph {
             output.push_str("\n\n");
             in_paragraph = false;
             paragraph_in_wrapped_bold_run = false;
@@ -1436,6 +1546,13 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // Don't immediately end list on paragraph break
         // Let the continuation check below decide if we're still in a list
         prev_y = line.y;
+        prev_line_end = line_end(line);
+        if !in_paragraph {
+            paragraph_reached_margin = false;
+        }
+        if page_right.is_some_and(|right| prev_line_end.right >= right * FULL_LINE_RATIO) {
+            paragraph_reached_margin = true;
+        }
 
         // Get text with optional bold/italic formatting
         let text = line.text_with_formatting(
@@ -1472,6 +1589,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             && !wrapped_quoted_paragraph_lines.contains(&line_idx)
             && plain_trimmed.len() > 3
             && plain_trimmed.split_whitespace().count() <= 15
+            && !is_display_callout(line, plain_trimmed, base_size)
             && !is_toc_entry_line(plain_trimmed)
             && !is_heading_fragment(plain_trimmed)
             && toc_suppress_page != Some(line.page)
@@ -1533,6 +1651,18 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
             }
         }
 
+        // A display-size callout ("18%") is emphasis, not structure: it goes
+        // out bold on its own line and never opens a heading.
+        if options.detect_headers && is_display_callout(line, plain_trimmed, base_size) {
+            if in_paragraph {
+                output.push_str("\n\n");
+                in_paragraph = false;
+                paragraph_in_wrapped_bold_run = false;
+            }
+            output.push_str(&format!("**{}**\n\n", plain_trimmed));
+            in_list = false;
+            continue;
+        }
         // Detect list items
         if options.detect_lists && is_list_item(plain_trimmed) {
             if in_paragraph {
@@ -1655,6 +1785,60 @@ mod tests {
             mcid,
             baseline_shift: 0.0,
         }
+    }
+
+    fn placed(text: &str, x: f32, y: f32, width: f32, size: f32, bold: bool) -> TextItem {
+        let mut item = make_item(text, 1, None);
+        item.x = x;
+        item.y = y;
+        item.width = width;
+        item.height = size;
+        item.font_size = size;
+        item.is_bold = bold;
+        item
+    }
+
+    fn body(text: &str, y: f32, width: f32) -> TextLine {
+        make_line(vec![placed(text, 72.0, y, width, 11.0, false)])
+    }
+
+    #[test]
+    fn a_display_number_on_the_sentence_baseline_is_bold_not_an_h1() {
+        let lines = vec![
+            body("NBI uses only blue and green light and this is body text.", 700.0, 450.0),
+            body("More body text with the ordinary size follows here.", 686.0, 440.0),
+            make_line(vec![
+                placed("18%", 72.0, 600.0, 90.0, 60.0, true),
+                placed("Detects 18% more true-positive lesions", 180.0, 600.0, 300.0, 11.0, true),
+            ]),
+            body("Text after the callout continues in the body size.", 560.0, 420.0),
+        ];
+        let md = to_markdown_from_lines(lines, MarkdownOptions::default());
+        assert!(md.contains("**18%**"), "{md}");
+        assert!(!md.contains("# 18%"), "{md}");
+        assert!(md.contains("Detects 18% more true-positive lesions"), "{md}");
+        assert!(!md.contains("18% Detects"), "the display run is split off the sentence:\n{md}");
+    }
+
+    #[test]
+    fn a_short_sentence_ending_line_starts_a_new_paragraph_a_full_one_does_not() {
+        let mut lines = Vec::new();
+        for i in 0..6 {
+            lines.push(body("Filler line that runs the full measure of the column.", 760.0 - i as f32 * 14.0, 450.0));
+        }
+        lines.push(body("An example from daily clinical practice illustrates", 660.0, 450.0));
+        lines.push(body("that before a patient deteriorates, NBI helps.", 646.0, 240.0));
+        lines.push(body("Numerous studies highlight the clinical value.", 632.0, 450.0));
+        lines.push(body("Together with high image quality it can help.", 618.0, 450.0));
+        let md = to_markdown_from_lines(lines, MarkdownOptions::default());
+        assert!(
+            md.contains("NBI helps.\n\nNumerous studies"),
+            "short sentence end opens a paragraph:\n{md}"
+        );
+        assert!(
+            md.contains("clinical value. Together with"),
+            "a full-measure sentence end is a wrapped line:\n{md}"
+        );
     }
 
     fn make_line(items: Vec<TextItem>) -> TextLine {

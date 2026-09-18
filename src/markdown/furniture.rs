@@ -500,7 +500,8 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         .map(|(text, _)| text)
         .collect();
 
-    if candidates.is_empty() && band_candidates.is_empty() {
+    let short_token_removals = repeated_short_token_lines(&lines, page_count, &protected_bands);
+    if candidates.is_empty() && band_candidates.is_empty() && short_token_removals.is_empty() {
         return lines;
     }
 
@@ -600,6 +601,7 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         }
     }
 
+    removal_set.extend(short_token_removals);
     if removal_set.is_empty() {
         return lines;
     }
@@ -610,6 +612,127 @@ fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec<TextLine> 
         .filter(|(idx, _)| !removal_set.contains(idx))
         .map(|(_, line)| line)
         .collect()
+}
+
+/// Web-to-PDF exports repeat interface chrome wherever the source page had
+/// it: "COPY" beside every code block. Such a token is one to three words,
+/// carries no sentence punctuation, shows up on half the pages or more, and
+/// — unlike a running header or a repeated short heading, which sit at one
+/// height — wanders with the content it decorates. Every occurrence goes,
+/// the first one included.
+fn repeated_short_token_lines(
+    lines: &[TextLine],
+    page_count: u32,
+    protected_bands: &HashSet<(u32, i32)>,
+) -> HashSet<usize> {
+    const MAX_CHARS: usize = 20;
+    const MAX_WORDS: usize = 3;
+    const WANDERING_Y_STDDEV: f32 = 0.05;
+    let threshold = 3u32.max(page_count / 2);
+    let mut page_span: HashMap<u32, (f32, f32)> = HashMap::new();
+    for line in lines {
+        let entry = page_span.entry(line.page).or_insert((line.y, line.y));
+        entry.0 = entry.0.min(line.y);
+        entry.1 = entry.1.max(line.y);
+    }
+    let avg_span = (page_span.values().map(|(lo, hi)| hi - lo).sum::<f32>()
+        / page_span.len().max(1) as f32)
+        .max(1.0);
+    let mut pages_by_text: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut lines_by_text: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let text = normalize_whitespace(&line.text());
+        let words = text.split_whitespace().count();
+        if text.chars().count() > MAX_CHARS
+            || words == 0
+            || words > MAX_WORDS
+            || !text.chars().any(|c| c.is_alphabetic())
+            || text.chars().any(|c| c.is_ascii_digit())
+            || text.ends_with(['.', ':', ';', ',', '?', '!'])
+            || is_structural_line(&text)
+        {
+            continue;
+        }
+        pages_by_text.entry(text.clone()).or_default().insert(line.page);
+        lines_by_text.entry(text).or_default().push(idx);
+    }
+    let mut removal = HashSet::new();
+    for (text, pages) in pages_by_text {
+        if (pages.len() as u32) < threshold {
+            continue;
+        }
+        let ys: Vec<f32> = lines_by_text[&text].iter().map(|idx| lines[*idx].y).collect();
+        let mean = ys.iter().sum::<f32>() / ys.len() as f32;
+        let stddev = (ys.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / ys.len() as f32).sqrt();
+        if stddev / avg_span < WANDERING_Y_STDDEV {
+            continue;
+        }
+        for idx in &lines_by_text[&text] {
+            let line = &lines[*idx];
+            if !protected_bands.contains(&(line.page, (line.y * 10.0).round() as i32)) {
+                removal.insert(*idx);
+            }
+        }
+    }
+    removal
+}
+
+#[cfg(test)]
+mod short_token_tests {
+    use super::*;
+    use crate::types::{ItemType, TextItem};
+
+    fn line(text: &str, page: u32, y: f32) -> TextLine {
+        TextLine {
+            items: vec![TextItem {
+                text: text.into(),
+                x: 40.0,
+                y,
+                width: text.len() as f32 * 5.0,
+                height: 10.0,
+                rotation: 0.0,
+                advance_known: true,
+                font: String::new(),
+                font_tag: String::new(),
+                font_size: 10.0,
+                page,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+                baseline_shift: 0.0,
+            }],
+            y,
+            page,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    #[test]
+    fn a_copy_button_repeated_at_random_heights_goes_and_prose_stays() {
+        let mut lines = Vec::new();
+        let prose = [
+            "Alpha paragraph about mucosa and vessels",
+            "Bravo paragraph about lesions and margins",
+            "Charlie paragraph about contrast and light",
+            "Delta paragraph about biopsies and follow-ups",
+            "Echo paragraph about wavelengths and depth",
+            "Foxtrot paragraph about clinical studies",
+        ];
+        for page in 1..=6u32 {
+            lines.push(line(prose[(page - 1) as usize], page, 700.0));
+            lines.push(line("COPY", page, 700.0 - page as f32 * 37.0));
+            if page % 3 == 0 {
+                lines.push(line("Note", page, 300.0));
+            }
+        }
+        let kept = strip_header_footer_lines(lines, 6);
+        assert!(kept.iter().all(|l| l.text().trim() != "COPY"));
+        assert_eq!(kept.iter().filter(|l| l.text().trim() == "Note").count(), 2, "two pages is below the floor of three");
+        assert_eq!(kept.iter().filter(|l| l.text().contains("paragraph about")).count(), 6);
+    }
 }
 
 #[cfg(test)]
