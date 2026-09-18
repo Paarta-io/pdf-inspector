@@ -538,7 +538,7 @@ fn extract_pages_markdown_mem_impl(
     // fragments. Drop them here, before layout analysis sees them.
     if !markdown_options.extra_image_regions.is_empty() {
         all_items.retain(|item| {
-            item.item_type != types::ItemType::Text
+            !matches!(item.item_type, types::ItemType::Text)
                 || !markdown_options.extra_image_regions.iter().any(|region| {
                     region.page == item.page
                         && item.x + item.width / 2.0 >= region.x
