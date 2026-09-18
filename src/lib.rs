@@ -533,6 +533,21 @@ fn extract_pages_markdown_mem_impl(
         } else {
             extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
         };
+    // Caller-supplied figure regions are rendered by the caller, text and all: the labels,
+    // tick values and legends printed inside them would otherwise leak into the prose as
+    // fragments. Drop them here, before layout analysis sees them.
+    if !markdown_options.extra_image_regions.is_empty() {
+        all_items.retain(|item| {
+            item.item_type != types::ItemType::Text
+                || !markdown_options.extra_image_regions.iter().any(|region| {
+                    region.page == item.page
+                        && item.x + item.width / 2.0 >= region.x
+                        && item.x + item.width / 2.0 <= region.x + region.width
+                        && item.y + item.height / 2.0 >= region.y
+                        && item.y + item.height / 2.0 <= region.y + region.height
+                })
+        });
+    }
     // Caller-supplied figure regions become image items so they get reading-order placeholders.
     for (i, region) in markdown_options.extra_image_regions.iter().enumerate() {
         all_items.push(TextItem {
