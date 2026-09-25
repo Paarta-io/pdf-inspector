@@ -72,12 +72,23 @@ pub(crate) fn is_caption_line(text: &str) -> bool {
 /// also demoting numbered headings.
 pub(crate) fn starts_with_bullet_marker(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with("• ")
-        || trimmed.starts_with("● ")
-        || trimmed.starts_with("○ ")
-        || trimmed.starts_with("◦ ")
-        || trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
+    ["• ", "● ", "○ ", "◦ ", "▪ ", "■ ", "‣ ", "– ", "— ", "✓ ", "✔ ", "- ", "* "]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+}
+
+/// An infographic callout: a few words dominated by a figure ("18%", "3x",
+/// "2 500 000", "+23 %"). Set in display type it outranks every heading
+/// tier, but it is emphasis, not structure.
+pub(crate) fn is_callout_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    let words = trimmed.split_whitespace().count();
+    if trimmed.is_empty() || words > 3 {
+        return false;
+    }
+    let digits = trimmed.chars().filter(|c| c.is_ascii_digit()).count();
+    let letters = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+    digits > 0 && digits >= letters
 }
 
 /// Check if text looks like a list item
@@ -91,6 +102,13 @@ pub(crate) fn is_list_item(text: &str) -> bool {
         || trimmed.starts_with("○ ")
         || trimmed.starts_with("● ")
         || trimmed.starts_with("◦ ")
+        || trimmed.starts_with("▪ ")
+        || trimmed.starts_with("■ ")
+        || trimmed.starts_with("‣ ")
+        || trimmed.starts_with("– ")
+        || trimmed.starts_with("— ")
+        || trimmed.starts_with("✓ ")
+        || trimmed.starts_with("✔ ")
     {
         return true;
     }
@@ -127,7 +145,7 @@ pub(crate) fn format_list_item(text: &str) -> String {
 
     // Convert various bullet styles to markdown
     // Note: bullet characters like • are multi-byte in UTF-8, use char indices
-    for bullet in &['•', '○', '●', '◦'] {
+    for bullet in &['•', '○', '●', '◦', '▪', '■', '‣', '–', '—', '✓', '✔'] {
         if let Some(rest) = trimmed.strip_prefix(*bullet) {
             return format!("- {}", rest.trim_start());
         }

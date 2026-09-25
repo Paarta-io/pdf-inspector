@@ -58,7 +58,7 @@ pub use extractor::{
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
+    to_markdown_from_items_with_rects_and_page_count, ImageRegion, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
@@ -470,15 +470,19 @@ pub fn extract_pages_markdown_mem(
     buffer: &[u8],
     pages: Option<&[u32]>,
 ) -> Result<PagesExtractionResult, PdfError> {
-    extract_pages_markdown_mem_impl(
-        buffer,
-        pages,
-        None,
-        &MarkdownOptions::default(),
-        false,
-        false,
-    )
-    .map(|extraction| extraction.result)
+    extract_pages_markdown_mem_with_options(buffer, pages, &MarkdownOptions::default())
+}
+
+/// [`extract_pages_markdown_mem`] with caller-supplied markdown options; `include_images`
+/// emits `![Image: …](pdfimg:…)` placeholders in reading order (see
+/// [`markdown::image_placeholder_target`]) without affecting the OCR verdict.
+pub fn extract_pages_markdown_mem_with_options(
+    buffer: &[u8],
+    pages: Option<&[u32]>,
+    markdown_options: &MarkdownOptions,
+) -> Result<PagesExtractionResult, PdfError> {
+    extract_pages_markdown_mem_impl(buffer, pages, None, markdown_options, false, false)
+        .map(|extraction| extraction.result)
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -519,7 +523,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
+    let ((mut all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -529,6 +533,44 @@ fn extract_pages_markdown_mem_impl(
         } else {
             extractor::extract_positioned_text_from_doc(&doc, &font_cmaps, None)?
         };
+    // Caller-supplied figure regions are rendered by the caller, text and all: the labels,
+    // tick values and legends printed inside them would otherwise leak into the prose as
+    // fragments. Drop them here, before layout analysis sees them.
+    if !markdown_options.extra_image_regions.is_empty() {
+        all_items.retain(|item| {
+            !matches!(item.item_type, types::ItemType::Text)
+                || !markdown_options.extra_image_regions.iter().any(|region| {
+                    region.page == item.page
+                        && item.x + item.width / 2.0 >= region.x
+                        && item.x + item.width / 2.0 <= region.x + region.width
+                        && item.y + item.height / 2.0 >= region.y
+                        && item.y + item.height / 2.0 <= region.y + region.height
+                })
+        });
+    }
+    // Caller-supplied figure regions become image items so they get reading-order placeholders.
+    for (i, region) in markdown_options.extra_image_regions.iter().enumerate() {
+        all_items.push(TextItem {
+            text: format!("[Image: region-{i}]"),
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+            rotation: 0.0,
+            advance_known: false,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size: 0.0,
+            page: region.page,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: types::ItemType::Image,
+            mcid: None,
+            baseline_shift: 0.0,
+        });
+    }
     let text_quality = analyze_text_quality(&all_items);
 
     // Resolve page numbers with full-document context before partitioning.
@@ -672,8 +714,13 @@ fn extract_pages_markdown_mem_impl(
             )
         };
 
+        let md_text = if markdown_options.include_images {
+            markdown::without_image_placeholders(&md)
+        } else {
+            md.clone()
+        };
         let has_decoding_issue = has_text_quality_issue
-            || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+            || (!md_text.is_empty() && (is_cid_garbage(&md_text) || detect_encoding_issues(&md_text)));
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -690,9 +737,9 @@ fn extract_pages_markdown_mem_impl(
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
         let needs_ocr = ocr_reason.is_some()
-            || md.trim().is_empty()
+            || md_text.trim().is_empty()
             || has_gid
-            || is_garbage_text(&md)
+            || is_garbage_text(&md_text)
             || has_template_image
             || has_vector_text;
 

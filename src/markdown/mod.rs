@@ -558,6 +558,46 @@ fn is_running_furniture_table(
     total > 0 && (furniture as f32) >= (total as f32) * 0.8
 }
 
+/// A source-code listing printed on a background rectangle (web-to-PDF docs,
+/// IDE exports) clusters into columns at the token gaps and comes back as a
+/// table. Its rows are statements, not records: nearly every row reads as
+/// code once the cells are joined, and at least one row opens with a
+/// declaration keyword or closes a statement. A reference table whose cells
+/// merely contain signatures or symbols does neither.
+fn is_code_block_table(table: &crate::tables::Table) -> bool {
+    let rows: Vec<String> = table
+        .cells
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.trim())
+                .filter(|cell| !cell.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|row| !row.is_empty())
+        .collect();
+    if rows.len() < 2 {
+        return false;
+    }
+    let code_rows = rows.iter().filter(|row| is_code_like(row)).count();
+    let statement_rows = rows.iter().filter(|row| opens_or_closes_statement(row)).count();
+    code_rows * 5 >= rows.len() * 4 && statement_rows > 0
+}
+
+fn opens_or_closes_statement(row: &str) -> bool {
+    const OPENERS: [&str; 14] = [
+        "const ", "let ", "var ", "import ", "export ", "function ", "class ", "def ", "fn ",
+        "pub fn ", "return ", "if (", "for (", "while (",
+    ];
+    let trimmed = row.trim();
+    OPENERS.iter().any(|opener| trimmed.starts_with(opener))
+        || trimmed.ends_with(';')
+        || trimmed.ends_with('{')
+        || trimmed.ends_with("});")
+        || trimmed == "}"
+}
+
 /// Reject a heuristic table only when its cells are overwhelmingly parallel
 /// prose fragments. This is deliberately narrower than disabling body-font
 /// detection for the whole page: numeric, compact, headed, and otherwise
@@ -875,6 +915,15 @@ impl TableDetectionOutput {
         table: &crate::tables::Table,
         chart_order: Option<ChartProseOrder>,
     ) {
+        if is_code_block_table(table) {
+            log::debug!(
+                "page {}: rejected {}x{} table hypothesis made of code lines",
+                page,
+                table.rows.len(),
+                table.columns.len()
+            );
+            return;
+        }
         self.pages_with_detected_tables.insert(page);
         match self.mode {
             TableOutputMode::Markdown => {
@@ -1291,6 +1340,20 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Caller-known figure regions (vector drawings the caller renders itself) that should get an
+    /// image placeholder in reading order like image XObjects do.
+    pub extra_image_regions: Vec<ImageRegion>,
+}
+
+/// A page region in the visible-page-box frame (points, lower-left origin, `y` = bottom edge).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRegion {
+    /// 1-indexed page.
+    pub page: u32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 impl Default for MarkdownOptions {
@@ -1320,6 +1383,7 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            extra_image_regions: Vec::new(),
         }
     }
 }
@@ -1389,6 +1453,25 @@ pub(crate) fn strip_repeated_header_footer_lines(
 }
 
 /// Convert positioned text items to markdown with structure detection
+/// Scheme of the placeholder target `include_images` emits: `pdfimg:<page>:<ordinal>:<x>:<y>:<w>:<h>`
+/// (1-indexed page, ordinal in content-stream order, bbox in PDF points with the page's lower-left origin).
+pub const IMAGE_PLACEHOLDER_SCHEME: &str = "pdfimg:";
+
+pub fn image_placeholder_target(page: u32, ordinal: u32, x: f32, y: f32, width: f32, height: f32) -> String {
+    format!("{IMAGE_PLACEHOLDER_SCHEME}{page}:{ordinal}:{x:.2}:{y:.2}:{width:.2}:{height:.2}")
+}
+
+/// `markdown` with the `include_images` placeholder lines removed, for quality checks that must
+/// judge text only (an image-only scan is still a scan).
+pub fn without_image_placeholders(markdown: &str) -> String {
+    let scheme = format!("]({IMAGE_PLACEHOLDER_SCHEME}");
+    markdown
+        .lines()
+        .filter(|line| !(line.starts_with("![") && line.contains(&scheme)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn to_markdown_from_items(items: Vec<TextItem>, options: MarkdownOptions) -> String {
     to_markdown_from_items_with_rects(items, options, &[])
 }
@@ -2141,13 +2224,22 @@ fn convert_items_with_rects_lines_and_table_output(
     // Images are also removed before line grouping, so give them the same
     // logical chart-page position as tables before reinsertion.
     let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
+    let mut page_image_ordinals: HashMap<u32, u32> = HashMap::new();
     for img in &images {
         let img_name = img
             .text
             .strip_prefix("[Image: ")
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(&img.text);
-        let img_md = format!("![Image: {}](image)\n", img_name);
+        // Ordinal in content-stream order plus the bbox in the page frame, so a
+        // caller holding the decoded XObjects can pair each placeholder with its pixels.
+        let ordinal = page_image_ordinals.entry(img.page).or_insert(0);
+        let img_md = format!(
+            "![Image: {}]({})\n",
+            img_name,
+            image_placeholder_target(img.page, *ordinal, img.x, img.y, img.width, img.height)
+        );
+        *ordinal += 1;
         page_images
             .entry(img.page)
             .or_default()
@@ -3501,3 +3593,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod code_block_table_tests {
+    use super::is_code_block_table;
+    use crate::tables::{Table, TableKind};
+
+    fn table(cells: Vec<Vec<&str>>) -> Table {
+        let cols = cells.iter().map(|r| r.len()).max().unwrap_or(0);
+        Table {
+            columns: (0..cols).map(|c| c as f32 * 100.0).collect(),
+            rows: (0..cells.len()).map(|r| 700.0 - r as f32 * 20.0).collect(),
+            cells: cells
+                .into_iter()
+                .map(|r| r.into_iter().map(String::from).collect())
+                .collect(),
+            item_indices: Vec::new(),
+            kind: TableKind::Data,
+        }
+    }
+
+    #[test]
+    fn a_code_listing_split_at_token_gaps_is_not_a_table() {
+        let listing = table(vec![
+            vec!["const {createHmac", "}", "= await", "import('node:crypto');"],
+            vec!["const secret", "= 'abcdefg';", "", ""],
+            vec!["const hash console.log(", "= createHmac('sha256',", "love", "secret) cupcakes')"],
+        ]);
+        assert!(is_code_block_table(&listing));
+    }
+
+    #[test]
+    fn an_api_reference_table_with_signatures_in_cells_stays_a_table() {
+        let reference = table(vec![
+            vec!["Key Type", "Description", "OID"],
+            vec!["'dh'", "Diffie-Hellman", "1.2.840.113549.1.3.1"],
+            vec!["'ec'", "Elliptic curve", "1.2.840.10045.2.1"],
+            vec!["cipher.update(data[, inputEncoding][, outputEncoding])", "Updates the cipher", ""],
+        ]);
+        assert!(!is_code_block_table(&reference));
+    }
+}
+

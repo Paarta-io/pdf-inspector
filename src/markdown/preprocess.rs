@@ -411,3 +411,114 @@ mod tests {
         assert_eq!(result.len(), 2, "tiered heading must not absorb bold body");
     }
 }
+
+/// Display-size ratio from which two runs on one baseline are typeset as
+/// different things: an infographic number and its caption, a drop-in
+/// pull quote and body text. Below it the size difference is emphasis
+/// inside one line (a bold lead-in, a superscript), above it the runs
+/// only share a baseline by layout accident.
+const CALLOUT_SIZE_RATIO: f32 = 1.7;
+
+/// Split lines whose runs differ in size by [`CALLOUT_SIZE_RATIO`] or more
+/// when the display run is a figure, so the "18%" set in 60pt stops being
+/// glued to the 11pt sentence beside it (and dragging it into an H1). Mixed
+/// sizes around words (a title page's product name and tagline) stay one
+/// line: their grouping is the heading detector's call.
+pub(crate) fn split_display_runs(lines: Vec<TextLine>) -> Vec<TextLine> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let sizes: Vec<f32> = line
+            .items
+            .iter()
+            .filter(|item| !item.text.trim().is_empty() && item.font_size > 0.0)
+            .map(|item| item.font_size)
+            .collect();
+        let (Some(min), Some(max)) = (
+            sizes.iter().copied().reduce(f32::min),
+            sizes.iter().copied().reduce(f32::max),
+        ) else {
+            out.push(line);
+            continue;
+        };
+        if max / min < CALLOUT_SIZE_RATIO {
+            out.push(line);
+            continue;
+        }
+        let cut = max / CALLOUT_SIZE_RATIO;
+        let (display, text): (Vec<TextItem>, Vec<TextItem>) = line
+            .items
+            .iter()
+            .cloned()
+            .partition(|item| item.font_size >= cut);
+        let display_text: String =
+            display.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join(" ");
+        if display.is_empty() || text.is_empty() || !super::classify::is_callout_text(&display_text) {
+            out.push(line);
+            continue;
+        }
+        for items in [display, text] {
+            out.push(TextLine {
+                y: items[0].y,
+                page: line.page,
+                adaptive_threshold: line.adaptive_threshold,
+                items,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod display_run_tests {
+    use super::split_display_runs;
+    use crate::types::{ItemType, TextItem, TextLine};
+
+    fn item(text: &str, x: f32, size: f32) -> TextItem {
+        TextItem {
+            text: text.into(),
+            x,
+            y: 500.0,
+            width: text.len() as f32 * size * 0.5,
+            height: size,
+            rotation: 0.0,
+            advance_known: true,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size: size,
+            page: 1,
+            is_bold: true,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_display_number_leaves_the_sentence_it_shares_a_baseline_with() {
+        let line = TextLine {
+            items: vec![item("18%", 50.0, 60.0), item("Detects 18% more lesions", 200.0, 11.0)],
+            y: 500.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        let lines = split_display_runs(vec![line]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text().trim(), "18%");
+        assert_eq!(lines[1].text().trim(), "Detects 18% more lesions");
+    }
+
+    #[test]
+    fn a_bold_lead_in_stays_one_line() {
+        let line = TextLine {
+            items: vec![item("Note:", 50.0, 12.0), item("read this first", 90.0, 11.0)],
+            y: 500.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        };
+        assert_eq!(split_display_runs(vec![line]).len(), 1);
+    }
+}
+
